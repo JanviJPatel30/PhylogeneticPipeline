@@ -1,0 +1,56 @@
+#!/bin/bash
+
+# ============================================================
+# Phylogenetic Pipeline - Installation Script
+# ============================================================
+# This script installs all required dependencies for running
+# the phylogenetic analysis pipeline.
+#
+# Tested on: Ubuntu/Linux environments
+# ============================================================
+
+echo "Updating system packages..."
+sudo apt-get update -qq
+
+# ------------------------------------------------------------
+# Install core Python dependencies
+# ------------------------------------------------------------
+echo "Installing Python libraries..."
+pip install biopython dendropy scipy matplotlib ete3
+
+# ------------------------------------------------------------
+# Install Multiple Sequence Alignment (MSA) tools
+# ------------------------------------------------------------
+echo "Installing MSA tools (MAFFT, MUSCLE, ClustalW)..."
+sudo apt-get install -y mafft muscle clustalw
+
+# ------------------------------------------------------------
+# Install Maximum Likelihood tool (IQ-TREE)
+# ------------------------------------------------------------
+echo "Installing IQ-TREE..."
+
+# Download IQ-TREE binary
+wget -q https://github.com/iqtree/iqtree2/releases/download/v2.3.5/iqtree-2.3.5-Linux.tar.gz
+
+# Extract files
+tar -xzf iqtree-2.3.5-Linux.tar.gz
+
+# Move binary to system path
+sudo mv iqtree-2.3.5-Linux/iqtree2 /usr/local/bin/
+
+# Verify installation
+iqtree2 -h
+
+# ------------------------------------------------------------
+# Install PHYLIP (for parsimony methods, optional)
+# ------------------------------------------------------------
+echo "Installing PHYLIP..."
+sudo apt-get install -y phylip
+
+# Verify PHYLIP installation
+which dnapars
+
+# ------------------------------------------------------------
+# Installation complete
+# ------------------------------------------------------------
+echo "All dependencies installed successfully!"

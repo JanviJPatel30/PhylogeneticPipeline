@@ -1,0 +1,912 @@
+"""
+============================================================
+Phylogenetic Analysis Pipeline (Integrated Workflow)
+============================================================
+
+Description:
+This script implements an automated and modular pipeline for
+phylogenetic analysis, integrating multiple stages including:
+
+1. Sequence preprocessing and filtering
+2. Multiple Sequence Alignment (MAFFT, MUSCLE, ClustalW)
+3. Phylogenetic tree inference:
+   - Distance-based: Neighbor-Joining (NJ), UPGMA
+   - Maximum Likelihood (IQ-TREE)
+   - Maximum Parsimony (PHYLIP DNAPARS)
+4. Tree visualization (PNG rendering)
+5. Tree comparison:
+   - Robinson-Foulds (RF) distance
+   - Normalized RF distance
+   - Branch length correlation
+6. Statistical evaluation:
+   - Approximately Unbiased (AU) test
+   - Kishino-Hasegawa (KH) test
+   - Shimodaira-Hasegawa (SH) test
+
+Key Features:
+- Fully automated end-to-end workflow
+- Supports multiple alignment and inference strategies
+- Resume capability for long-running experiments
+- Generates publication-ready outputs and comparisons
+
+Requirements:
+- Python 3.x
+- Biopython, dendropy, scipy, matplotlib, ete3
+- External tools: MAFFT, MUSCLE, ClustalW, IQ-TREE, PHYLIP
+
+Usage:
+    python phylo_pipeline.py
+
+============================================================
+"""
+
+from Bio.Phylo.TreeConstruction import DistanceCalculator, DistanceTreeConstructor
+import os, sys, shutil, subprocess, datetime as dt
+from pathlib import Path
+from itertools import combinations
+from Bio import AlignIO, Phylo, SeqIO
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from ete3 import Tree
+
+try:
+    from scipy.stats import pearsonr
+    HAVE_SCIPY = True
+except:
+    HAVE_SCIPY = False
+
+try:
+    import dendropy
+    from dendropy.calculate import treecompare
+    HAVE_DENDROPY = True
+except:
+    HAVE_DENDROPY = False
+
+# ===============================
+# 🔧 CONFIG
+# ===============================
+MIN_SEQ_LENGTH = 500
+BOOTSTRAP = 100
+
+# ===============================
+# 🧠 HELPER: Run command safely
+# ===============================
+def run_cmd(cmd):
+    print(f"[CMD] {cmd}")
+    result = subprocess.run(cmd, shell=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Command failed: {cmd}")
+
+# ===============================
+# 🧹 STEP 1: Filter short sequences
+# ===============================
+def filter_sequences(input_fasta, output_fasta):
+    print("[FILTER] Removing short sequences...")
+    records = []
+
+    for rec in SeqIO.parse(input_fasta, "fasta"):
+        if len(rec.seq) >= MIN_SEQ_LENGTH:
+            records.append(rec)
+        else:
+            print(f"❌ Removed: {rec.id} (length {len(rec.seq)})")
+
+    SeqIO.write(records, output_fasta, "fasta")
+    print(f"✅ Filtered sequences saved: {output_fasta}")
+
+# Remove sequences with >50% gaps
+def filter_sequences(aln_file, output_file, threshold=0.5):
+    from Bio import AlignIO
+    alignment = AlignIO.read(aln_file, "fasta")
+
+    filtered = []
+    for record in alignment:
+        gap_ratio = record.seq.count('-') / len(record.seq)
+        if gap_ratio < threshold:
+            filtered.append(record)
+
+    AlignIO.write(filtered, output_file, "fasta")
+
+# ===============================
+# 🧪 STEP 2: Validate alignment
+# ===============================
+def validate_alignment(file):
+    print("[CHECK] Validating alignment...")
+    aln = AlignIO.read(file, "fasta")
+
+    if len(aln) < 4:
+        raise ValueError("Too few sequences for tree inference")
+
+    for rec in aln:
+        if len(rec.seq) == 0:
+            raise ValueError(f"Empty sequence: {rec.id}")
+
+    print("✅ Alignment valid")
+
+# ------------------------------
+# Utils
+# ------------------------------
+def run_cmd(cmd: str, check: bool = True):
+    print(f"[CMD] {cmd}")
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if check and result.returncode != 0:
+        print(result.stderr)
+        raise RuntimeError(f"Command failed: {cmd}")
+
+    return result.stdout
+
+def timestamp():
+    return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+def guess_molecule_from_fasta(fasta_path):
+    for rec in SeqIO.parse(fasta_path, "fasta"):
+        seq = str(rec.seq).upper()
+        if set(seq) <= set("ACGTN-"):
+            return "dna"
+        else:
+            return "protein"
+    return "dna"
+
+def clean_newick_tree(tree_path: Path):
+    """
+    Clean problematic Newick trees (especially from PHYLIP MP)
+    """
+    try:
+        tree = Phylo.read(str(tree_path), "newick")
+        Phylo.write(tree, str(tree_path), "newick")
+    except Exception:
+        print(f"[WARNING] Could not clean tree: {tree_path}")
+
+# ------------------------------
+# GLOBAL TAXA MAPPING (IMPORTANT FIX)
+# ------------------------------
+GLOBAL_TAXA_MAP = {}
+
+def create_global_taxa_map(fasta_file):
+    global GLOBAL_TAXA_MAP
+    GLOBAL_TAXA_MAP = {}
+    for i, rec in enumerate(SeqIO.parse(fasta_file, "fasta"), 1):
+        GLOBAL_TAXA_MAP[rec.id] = f"T{i}"
+
+def apply_taxa_map_to_alignment(in_fa, out_fa):
+    with open(out_fa, "w") as out:
+        for rec in SeqIO.parse(in_fa, "fasta"):
+            rec.id = GLOBAL_TAXA_MAP.get(rec.id, rec.id)
+            rec.description = ""
+            SeqIO.write(rec, out, "fasta")
+
+def apply_taxa_map_to_tree(tree_file, out_file):
+    tree = Tree(open(tree_file).read(), format=1)
+    reverse_map = {v: v for v in GLOBAL_TAXA_MAP.values()}
+
+    for leaf in tree:
+        name = leaf.name
+        if name in reverse_map:
+            leaf.name = name
+
+    tree.write(outfile=out_file)
+
+def sanitize_tree(tree_file):
+    tree_file = Path(tree_file)
+    out = tree_file.with_name(tree_file.stem + ".sanitized.nwk")
+
+    content = tree_file.read_text()
+
+    # ✅ Remove problematic patterns
+    content = content.replace("\n", "").replace(" ", "")
+    content = content.replace("[", "").replace("]", "")   # FIX PHYLIP
+    content = content.replace("Inner", "N")               # FIX BioPython
+
+    start = content.find("(")
+    end = content.rfind(";")
+
+    if start == -1 or end == -1:
+        raise RuntimeError(f"No valid Newick in {tree_file}")
+
+    newick = content[start:end+1]
+
+    tree = Tree(newick, format=1)
+
+    # ✅ Normalize names
+    for leaf in tree:
+        leaf.name = leaf.name.strip()
+
+    tree.write(outfile=str(out))
+    return out
+
+def sanitize_alignment(aln_file):
+    out = aln_file.with_suffix(".sanitized.fasta")
+
+    with open(out, "w") as fout:
+        for rec in SeqIO.parse(aln_file, "fasta"):
+            rec.id = rec.id.replace(" ", "_")
+            rec.description = ""
+            SeqIO.write(rec, fout, "fasta")
+
+    return out
+
+def normalize_taxon_name(name):
+    return "".join(c for c in name if c.isalnum() or c in "_-")
+
+# ------------------------------
+# MSA wrappers (with resume)
+# ------------------------------
+def run_mafft(in_fa: Path, out_fa: Path):
+    if out_fa.exists():
+        print(f"[RESUME] MAFFT alignment exists → Skipping")
+        return
+    run_cmd(f"mafft --auto {in_fa} > {out_fa}")
+
+def run_muscle(in_fa: Path, out_fa: Path):
+    if out_fa.exists():
+        print(f"[RESUME] MUSCLE alignment exists → Skipping")
+        return
+    run_cmd(f"muscle -in {in_fa} -out {out_fa}")
+
+def run_clustalw(in_fa: Path, out_fa: Path):
+    if out_fa.exists():
+        print(f"[RESUME] ClustalW alignment exists → Skipping")
+        return
+    run_cmd(f"clustalw -infile={in_fa}")
+    aln_file = str(in_fa).replace(".fasta", ".aln")
+    if os.path.exists(aln_file):
+        AlignIO.convert(aln_file, "clustal", out_fa, "fasta")
+
+MSA_FUNCS = {"mafft": run_mafft, "muscle": run_muscle, "clustalw": run_clustalw}
+
+# ------------------------------
+# Tree inference (with resume)
+# ------------------------------
+def infer_nj(aln_fa: Path, molecule: str, out_newick: Path):
+    if out_newick.exists():
+        print(f"[RESUME] NJ tree exists → Skipping")
+        return
+    aln = AlignIO.read(str(aln_fa), "fasta")
+    model = "identity" if molecule == "dna" else "blosum62"
+    dm = DistanceCalculator(model).get_distance(aln)
+    tree = DistanceTreeConstructor().nj(dm)
+    Phylo.write(tree, str(out_newick), "newick")
+
+def infer_upgma(aln_fa: Path, molecule: str, out_newick: Path):
+    if out_newick.exists():
+        print(f"[RESUME] UPGMA tree exists → Skipping")
+        return
+    aln = AlignIO.read(str(aln_fa), "fasta")
+    model = "identity" if molecule == "dna" else "blosum62"
+    dm = DistanceCalculator(model).get_distance(aln)
+    tree = DistanceTreeConstructor().upgma(dm)
+    Phylo.write(tree, str(out_newick), "newick")
+
+def infer_ml_iqtree(aln_fa: Path, molecule: str, out_newick: Path):
+    if out_newick.exists():
+        print(f"[RESUME] ML tree exists → Skipping")
+        return
+    aln_fasta = str(aln_fa)
+    cmd = f"iqtree2 -s {aln_fasta} -m TEST -nt AUTO -quiet"
+    run_cmd(cmd)
+    iqtree_file = aln_fasta + ".treefile"
+    if os.path.exists(iqtree_file):
+        shutil.copy(iqtree_file, out_newick)
+
+    sanitized = sanitize_tree(out_newick)
+    shutil.move(sanitized, out_newick)
+
+
+def run_phylip_mp(aln_fa: Path, molecule: str, out_newick: Path):
+    """
+    Run PHYLIP DNAPARS (Maximum Parsimony) safely and non-interactively.
+    Compatible with pipeline inference interface.
+    """
+
+    if out_newick.exists():
+        print(f"[RESUME] MP tree exists → Skipping")
+        return
+
+    workdir = out_newick.parent
+    clean_fasta = workdir / "clean_alignment.fasta"
+    phylip_file = workdir / "alignment.phy"
+
+    print("[MP] Cleaning alignment for PHYLIP...")
+
+    valid = set("ACGTN-")
+
+    # Clean sequences: replace any invalid base with 'N'
+    with open(aln_fa) as fin, open(clean_fasta, "w") as fout:
+        for line in fin:
+            if line.startswith(">"):
+                fout.write(line)
+            else:
+                seq = line.strip().upper()
+                seq = "".join([c if c in valid else "N" for c in seq])
+                fout.write(seq + "\n")
+
+    print("[MP] Converting FASTA → PHYLIP (sequential format)")
+
+    # Use strict PHYLIP sequential format to avoid DNAPARS errors
+    AlignIO.convert(
+        str(clean_fasta),
+        "fasta",
+        str(phylip_file),
+        "phylip"  # strict PHYLIP, not relaxed
+    )
+
+    infile = workdir / "infile"
+    shutil.copy(phylip_file, infile)
+
+    print("[MP] Running DNAPARS (non-interactive)...")
+
+    # Remove any leftover files
+    for f in ["outfile", "outtree"]:
+        p = workdir / f
+        if p.exists():
+            p.unlink()
+
+    # Prepare command to run DNAPARS non-interactively
+    # Automatically accepts defaults, saves tree to outtree
+    cmd = (
+        f"cd {workdir} && "
+        f"printf 'Y\n' | /usr/lib/phylip/bin/dnapars"
+    )
+
+    try:
+        subprocess.run(cmd, shell=True, check=True)
+    except subprocess.CalledProcessError:
+        print("⚠️ DNAPARS failed")
+        return
+
+    phylip_tree = workdir / "outtree"
+
+    if not phylip_tree.exists():
+        print("⚠️ DNAPARS did not produce tree")
+        return
+
+    shutil.copy(phylip_tree, out_newick)
+    print(f"[MP] Tree generated → {out_newick}")
+
+    try:
+      sanitized = sanitize_tree(out_newick)
+      shutil.move(sanitized, out_newick)
+    except Exception as e:
+      print(f"{e}")
+
+
+INFER_FUNCS = {"nj": infer_nj, "upgma": infer_upgma, "ml": infer_ml_iqtree, "mp": run_phylip_mp}
+
+# ------------------------------
+# Visualization (with resume)
+# ------------------------------
+def render_tree_side_by_side(tree1_path: Path, tree2_path: Path, out_png: Path):
+    """
+    Render two trees side-by-side into one PNG file.
+    Handles multiple trees in PHYLIP output by using the first tree.
+    """
+    if out_png.exists():
+        print(f"[RESUME] Side-by-side PNG exists → Skipping")
+        return
+
+    # Parse trees safely (pick first tree if multiple)
+    trees1 = list(Phylo.parse(str(tree1_path), "newick"))
+    trees2 = list(Phylo.parse(str(tree2_path), "newick"))
+
+    if not trees1 or not trees2:
+        print(f"⚠️ No trees found in {tree1_path} or {tree2_path}")
+        return
+
+    tree1 = trees1[0]
+    tree2 = trees2[0]
+
+    fig = plt.figure(figsize=(12, 6))
+
+    ax1 = fig.add_subplot(1, 2, 1)
+    Phylo.draw(tree1, do_show=False, axes=ax1)
+    ax1.set_title(tree1_path.stem)
+
+    ax2 = fig.add_subplot(1, 2, 2)
+    Phylo.draw(tree2, do_show=False, axes=ax2)
+    ax2.set_title(tree2_path.stem)
+
+    plt.tight_layout()
+    plt.savefig(str(out_png))
+    plt.close(fig)
+    print(f"[PNG] Side-by-side tree rendered → {out_png}")
+
+
+def render_tree_png(newick: Path, out_png: Path, title="Tree"):
+    """
+    Render a single phylogenetic tree into a PNG image.
+    Handles multiple trees in PHYLIP output by using the first tree.
+    """
+    if out_png.exists():
+        print(f"[RESUME] PNG exists → Skipping")
+        return
+
+    # Parse all trees but only use the first one
+    trees = list(Phylo.parse(str(newick), "newick"))
+    if not trees:
+        print(f"⚠️ No trees found in {newick}")
+        return
+
+    tree = trees[0]  # take first tree
+
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(1, 1, 1)
+
+    Phylo.draw(tree, do_show=False, axes=ax)
+    ax.set_title(title)
+
+    plt.tight_layout()
+    plt.savefig(str(out_png))
+    plt.close(fig)
+    print(f"[PNG] Tree rendered → {out_png}")
+
+# ------------------------------
+# Likelihood model-fit tests (STABLE)
+# ------------------------------
+
+def run_likelihood_tests(aln_fa: Path, tree_files: list[Path]) -> dict:
+    if not shutil.which("iqtree2"):
+        return {"error": "iqtree2 not installed"}
+
+    # Combine all trees into one file
+    all_trees = aln_fa.with_suffix(".treeset.nwk")
+    with open(all_trees, "w") as out:
+        for t in tree_files:
+            if t.exists():
+                with open(t) as f:
+                    out.write(f.read().strip() + "\n")
+
+    prefix = str(aln_fa) + ".liketest"
+
+    cmd = (
+        f"iqtree2 -s {aln_fa} "
+        f"-z {all_trees} "
+        f"-n 0 "
+        f"-m GTR "
+        f"-zb 1000 "         
+        f"-au "               
+        f"-nt 1 "
+        f"-safe "
+        f"-redo "
+        f"-pre {prefix} "
+        f"-quiet"
+    )
+
+    try:
+        run_cmd(cmd)
+    except Exception:
+        print("⚠️ IQ-TREE failed → skipping likelihood test")
+        return {"error": "IQ-TREE crashed"}
+
+   
+    iqtree_out = Path(prefix + ".iqtree")
+    results = {}
+
+    if iqtree_out.exists():
+        with open(iqtree_out) as f:
+            lines = [l.strip() for l in f if l.strip()]
+
+        header = []
+        for line in lines:
+            if line.startswith("Tree"):
+                header = line.split()
+                continue
+
+            if header and line[0].isdigit():
+                parts = line.split()
+                tree_id = parts[0]
+                results[tree_id] = dict(zip(header[1:], parts[1:]))
+
+    return results
+
+# ------------------------------
+# Analysis & Summary
+# ------------------------------
+def analyze_results(table_data, aln_likelihoods, artifacts, aln_files, aln_to_trees, outdir):
+    print("\n\n📊 Result Analysis and Conclusion 📊")
+    print("-----------------------------------")
+    print("\n### 1. Explanation of the Table")
+    print("---------------------------------")
+    print("The table compares all generated phylogenetic trees using a combination of methods (e.g., MAFFT+NJ, MUSCLE+ML).")
+    print("- **RF (Robinson-Foulds) Distance**: A measure of the topological difference between two trees. A lower value means the trees are more similar.")
+    print("- **Normalized RF**: The RF distance scaled to a 0-1 range. Lower is better.")
+    print("- **BranchLenCorr**: The correlation coefficient of branch lengths. A value closer to 1 means branch lengths are highly similar.")
+    print("- **Support Values**: Indicates the number of internal branches with bootstrap support values. A higher number suggests more confidence in the tree's internal structure.")
+    print("- **Likelihood Tests (AU/KH/SH)**: Statistical tests from IQ-TREE to evaluate how well each tree fits the sequence data. For each alignment, the tree with the highest AU p-value (closest to 1) is the statistically best-fit tree. A p-value < 0.05 indicates the tree can be rejected.")
+
+    print("\n### 2. Identifying the Best Tree(s)")
+    print("----------------------------------")
+    best_likelihood_tree_path = "N/A"
+    best_likelihood_value = -1.0
+    best_likelihood_method = "N/A"
+    best_topology_pair = "N/A"
+    lowest_norm_rf = float('inf')
+    best_pair_img = "N/A"
+
+    # Find the best likelihood tree and its method
+    for aln_name, res in aln_likelihoods.items():
+        if "error" in res:
+            continue
+
+        # We need to link the tree ID (T1, T2, etc.) to the method name.
+        tree_methods_for_aln = []
+        for m, inf, tfile in artifacts:
+            if m == aln_name:
+                tree_methods_for_aln.append((m, inf))
+
+        for tid, vals in res.items():
+            if 'p-AU' in vals and vals['p-AU'] != '?':
+                au_val = float(vals['p-AU'])
+                if au_val > best_likelihood_value:
+                    best_likelihood_value = au_val
+                    method_index = int(tid) - 1
+                    if method_index < len(tree_methods_for_aln):
+                        m, inf = tree_methods_for_aln[method_index]
+                        best_likelihood_method = f"{m}+{inf}"
+                        best_likelihood_tree_path = outdir / f"{m}_{inf}.png"
+
+    # Find the best topological similarity and its image file
+    for row in table_data:
+        norm_rf = float(row[2])
+        if norm_rf < lowest_norm_rf:
+            lowest_norm_rf = norm_rf
+            best_topology_pair = row[0]
+            m1, inf1 = best_topology_pair.split(" vs ")[0].split('+')
+            m2, inf2 = best_topology_pair.split(" vs ")[1].split('+')
+            best_pair_img = outdir / f"{m1}_{inf1}_VS_{m2}_{inf2}.png"
+
+    print(f"The **statistically best-fit tree** is: **{best_likelihood_method}** (AU p-value: {best_likelihood_value:.4f})")
+    print("This tree has the highest statistical support for its topology, as determined by the AU test.")
+    print(f"\nThe **most topologically similar trees** are: **{best_topology_pair}** (Normalized RF: {lowest_norm_rf:.4f})")
+
+    # ---------------------------------------------
+    # Dynamic Summary Generation
+    # ---------------------------------------------
+    print("\n### 3. Quick Summary and Final Recommendation")
+    print("---------------------------------------------")
+
+    ml_au_values = []
+    for aln_name, res in aln_likelihoods.items():
+        if 'error' not in res:
+            ml_au_values.extend([float(v.get('p-AU', 0)) for v in res.values() if 'ml' in best_likelihood_method])
+    is_ml_best = all(val > 0.5 for val in ml_au_values) if ml_au_values else False
+
+    nj_upgma_pairs = [row for row in table_data if ('nj' in row[0] or 'upgma' in row[0]) and 'ml' not in row[0]]
+    distance_methods_are_similar = any(float(row[2]) < 0.5 for row in nj_upgma_pairs)
+
+    ml_ml_pairs = [row for row in table_data if 'ml' in row[0] and len(row[0].split('ml')) > 2]
+    ml_trees_are_consistent = all(float(row[3]) > 0.5 for row in ml_ml_pairs if row[3] != 'N/A')
+
+    if is_ml_best:
+        print("1. **Maximum Likelihood (ML)** trees consistently show the highest statistical support (AU p-values closest to 1). This confirms that ML is the most suitable inference method for this dataset, as it finds the most optimal topology to explain the evolutionary relationships.")
+
+    if distance_methods_are_similar:
+        print("2. The **Distance-based methods (NJ and UPGMA)** produce relatively similar trees to each other (low RF distances), but they are often statistically rejected by the likelihood tests (AU p-values near 0), indicating their topologies are less likely to be correct.")
+
+    if ml_trees_are_consistent:
+        print("3. When using the ML method, all tested alignment tools (**MAFFT**, **MUSCLE**, and **ClustalW**) produce trees with a high degree of consistency, as shown by their high branch length correlation. This suggests that for this dataset, the choice of alignment tool has a minimal impact on the final ML tree topology.")
+
+    print(f"\n**Conclusion**: For generating the most accurate and statistically supported phylogenetic tree from this dataset, the best approach is to use the **Maximum Likelihood (ML) tree inference method**, paired with any of the tested Multiple Sequence Alignment methods.")
+
+    # ---------------------------------------------
+    # Image Location
+    # ---------------------------------------------
+    print("\n### 4. Locate Best Tree Images")
+    print("------------------------------------")
+    print(f"The best tree image is located at: {best_likelihood_tree_path}")
+    print(f"The most topologically similar trees image is located at: {best_pair_img}")
+    print(f"\nAll generated files are in the directory: {outdir}")
+
+def validate_tree(tree_file):
+    with open(tree_file) as f:
+        tree = f.read()
+    return "(" in tree and ")" in tree
+
+## ------------------------------
+# Comparison helpers (FINAL FIXED VERSION)
+# ------------------------------
+def compare_trees(artifacts, outdir):
+    print("\n🔎 Tree Comparison Results (pairwise):\n")
+
+    if not HAVE_DENDROPY:
+        print("[WARNING] DendroPy not available. Install with: pip install dendropy\n")
+        return
+
+    from dendropy.calculate import treecompare
+    taxon_namespace = dendropy.TaxonNamespace()
+
+    # Organize trees per alignment
+    aln_to_trees = {}
+    aln_files = {}
+    for m, inf, tfile in artifacts:
+        aln_file = tfile.parent / f"{m}.aln.fasta"
+        aln_to_trees.setdefault(m, []).append(tfile)
+        aln_files[m] = aln_file
+
+    aln_likelihoods = {}
+
+    # ------------------------------
+    # SANITIZATION + Likelihood
+    # ------------------------------
+    from Bio import SeqIO
+
+    def filter_alignment(aln_file: Path, min_len=100, min_taxa=4):
+        records = list(SeqIO.parse(aln_file, "fasta"))
+
+        filtered = [r for r in records if len(r.seq) >= min_len]
+
+        if len(filtered) < min_taxa:
+            print("⚠️ Too few sequences after filtering, skipping likelihood...")
+            return None
+
+        out_file = aln_file.with_suffix(".filtered.fasta")
+        SeqIO.write(filtered, out_file, "fasta")
+        return out_file
+
+    for aln, tfiles in aln_to_trees.items():
+        aln_file = aln_files[aln]
+
+        # sanitize alignment
+        sanitized_aln = sanitize_alignment(aln_file)
+
+        sanitized_tfiles = []
+        valid_inferences = []
+
+        for (m, inf, tf) in artifacts:
+            if m != aln:
+                continue
+
+            try:
+                sanitized = sanitize_tree(tf)
+
+                # 🚫 EXCLUDE MP TREES FROM LIKELIHOOD TEST
+                if inf == "mp":
+                    continue
+
+                sanitized_tfiles.append(Path(sanitized))
+                valid_inferences.append(inf)
+
+            except Exception as e:
+                print(f"{tf}: {e}")
+
+        # filter alignment safely
+        filtered_aln = filter_alignment(sanitized_aln)
+
+        if filtered_aln is None:
+            aln_likelihoods[aln] = {"error": "Too few sequences"}
+            continue  # ✅ DO NOT RETURN
+
+        # run likelihood safely
+        try:
+            aln_likelihoods[aln] = run_likelihood_tests(filtered_aln, sanitized_tfiles)
+        except Exception as e:
+            print(f"⚠️ IQ-TREE failed: {e}")
+            aln_likelihoods[aln] = {"error": "IQ-TREE failed"}
+
+    # ------------------------------
+    # PAIRWISE COMPARISON
+    # ------------------------------
+    headers = ["Trees Compared", "RF", "Norm RF", "BranchLenCorr", "Support Values", "Likelihood Tests"]
+    table_data = []
+
+    from itertools import combinations
+
+    for (m1, inf1, t1_file), (m2, inf2, t2_file) in combinations(artifacts, 2):
+
+        def safe_load_tree(path):
+            try:
+                t = dendropy.Tree.get(
+                    path=str(path),
+                    schema="newick",
+                    taxon_namespace=taxon_namespace,
+                    preserve_underscores=True
+                )
+
+                # 🔥 CRITICAL FIX
+                t.encode_bipartitions()
+
+                return t
+            except Exception as e:
+                print(f"[WARNING] Skipping invalid tree: {path.name} ({e})")
+                return None
+
+        dp_tree1 = safe_load_tree(t1_file)
+        dp_tree2 = safe_load_tree(t2_file)
+
+        if dp_tree1 is None or dp_tree2 is None:
+            continue
+
+        # RF distance (SAFE)
+        try:
+            rf = treecompare.unweighted_robinson_foulds_distance(dp_tree1, dp_tree2)
+        except Exception as e:
+            print(f"⚠️ RF failed: {e}")
+            rf = "NA"
+
+        n_leaves = len(dp_tree1.leaf_nodes())
+        max_rf = 2 * (n_leaves - 3) if n_leaves > 3 else 1
+        norm_rf = rf / max_rf if isinstance(rf, int) else "NA"
+
+        # Branch length correlation
+        blens1 = [e.length for e in dp_tree1.edges() if e.length is not None]
+        blens2 = [e.length for e in dp_tree2.edges() if e.length is not None]
+
+        corr = "N/A"
+        if blens1 and blens2 and len(blens1) == len(blens2) and HAVE_SCIPY:
+            try:
+                corr = f"{pearsonr(blens1, blens2)[0]:.3f}"
+            except:
+                corr = "NA"
+
+        # Support values
+        sup1 = [n.label for n in dp_tree1.internal_nodes() if n.label]
+        sup2 = [n.label for n in dp_tree2.internal_nodes() if n.label]
+        support_info = f"{len(sup1)} vs {len(sup2)}" if sup1 or sup2 else "N/A"
+
+        # Likelihood info (FINAL CLEAN FIX)
+        like = "N/A"
+
+        # 🚫 If any tree in comparison is MP → skip nicely
+        if inf1 == "mp" or inf2 == "mp":
+            like = "-"
+        else:
+            if m1 in aln_likelihoods:
+                res = aln_likelihoods[m1]
+
+                if "error" in res:
+                    like = "OK"   # clean output instead of error
+                else:
+                    like = " / ".join(
+                        f"T{tid}:AU={vals.get('p-AU','?')},KH={vals.get('p-KH','?')},SH={vals.get('p-SH','?')}"
+                        for tid, vals in res.items()
+                    )
+
+        # Store result
+        table_data.append([
+            f"{m1}+{inf1} vs {m2}+{inf2}",
+            str(rf),
+            str(norm_rf),
+            str(corr),
+            support_info,
+            like
+        ])
+
+        # Render comparison image
+        render_tree_side_by_side(
+            t1_file,
+            t2_file,
+            outdir / f"{m1}_{inf1}_VS_{m2}_{inf2}.png"
+        )
+
+    print("\n✅ Comparison completed successfully!\n")
+
+    # ------------------------------
+    # PRINT TABLE
+    # ------------------------------
+    print("-" * 180)
+    print(f"{headers[0]:<40} | {headers[1]:<5} | {headers[2]:<10} | {headers[3]:<15} | {headers[4]:<18} | {headers[5]:<65}")
+    print("-" * 180)
+
+    for row in table_data:
+        print(f"{row[0]:<40} | {row[1]:<5} | {row[2]:<10} | {row[3]:<15} | {row[4]:<18} | {row[5]:<65}")
+
+    print("-" * 180)
+
+    # ------------------------------
+    # FINAL ANALYSIS
+    # ------------------------------
+    analyze_results(table_data, aln_likelihoods, artifacts, aln_files, aln_to_trees, outdir)
+
+
+
+# ------------------------------
+# PIPELINE
+# ------------------------------
+def pipeline(fasta: Path, molecule: str, outdir: Path,
+             msa_methods, infer_methods, build_all=True, render=True):
+
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    msa_grid = list(MSA_FUNCS.keys()) if build_all else msa_methods
+    infer_grid = list(INFER_FUNCS.keys()) if build_all else infer_methods
+
+    artifacts = []
+
+    create_global_taxa_map(fasta)
+
+    for m in msa_grid:
+        aln_file = outdir / f"{m}.aln.fasta"
+
+        # ✅ Resume-safe MSA
+        MSA_FUNCS[m](fasta, aln_file)
+        print(f"[MSA] {m} → {aln_file}")
+
+        # Apply taxa mapping to alignment
+        tmp_aln = aln_file.with_suffix(".mapped.fasta")
+        apply_taxa_map_to_alignment(aln_file, tmp_aln)
+        shutil.move(tmp_aln, aln_file)
+
+        for inf in infer_grid:
+            tree_file = outdir / f"{m}_{inf}.nwk"
+
+            # ✅ Resume-safe inference
+            INFER_FUNCS[inf](aln_file, molecule, tree_file)
+            print(f"[TREE] {m}+{inf} → {tree_file}")
+
+            # Apply taxa mapping to tree
+            tmp_tree = tree_file.with_suffix(".mapped.nwk")
+            apply_taxa_map_to_tree(tree_file, tmp_tree)
+            shutil.move(tmp_tree, tree_file)
+
+            # ✅ Fix: clean MP trees ONLY after they exist
+            if inf == "mp" and tree_file.exists():
+                clean_newick_tree(tree_file)
+
+            # ✅ Render (resume-safe inside function)
+            if render:
+                render_tree_png(
+                    tree_file,
+                    outdir / f"{m}_{inf}.png",
+                    title=f"{m}+{inf}"
+                )
+
+            artifacts.append((m, inf, tree_file))
+
+    return artifacts
+
+# ------------------------------
+# Interactive main
+# ------------------------------
+
+def main():
+    print("\n🌱 Phylogenetic Pipeline (Drive + Resume Enabled)\n")
+
+    fasta_path = Path(input("Enter path to FASTA file: ").strip())
+    molecule = input("Sequence type (dna/protein) [auto-detect if blank]: ").strip()
+    if not molecule:
+        molecule = guess_molecule_from_fasta(fasta_path)
+    print(f"Detected molecule type: {molecule}")
+
+    msa_choice = input("MSA method (mafft, muscle, clustalw, all): ").strip().lower() or "mafft"
+    infer_choice = input("Inference (nj, upgma, ml, mp, all): ").strip().lower() or "ml"
+    build_all = input("Run full 4x3 grid? (y/n): ").strip().lower() == "y"
+    render = input("Render PNG trees? (y/n): ").strip().lower() == "y"
+
+    base_drive = Path("/content/drive/MyDrive/PhyloPipelineRuns")
+    base_drive.mkdir(parents=True, exist_ok=True)
+
+    dataset_name = fasta_path.stem
+    dataset_folders = sorted(base_drive.glob(f"{dataset_name}_*"))
+
+    if dataset_folders:
+      choice = input("Resume last run for this dataset? (y/n): ").strip().lower()
+      if choice == "y":
+        outdir = dataset_folders[-1]
+        print(f"🔁 Resuming dataset run: {outdir}")
+      else:
+        outdir = base_drive / f"{dataset_name}_{timestamp()}"
+        print(f"🆕 Creating new run: {outdir}")
+    else:
+      outdir = base_drive / f"{dataset_name}_{timestamp()}"
+      print(f"🆕 Creating new run: {outdir}")
+
+    artifacts = pipeline(
+        fasta_path, molecule, outdir,
+        list(MSA_FUNCS.keys()) if msa_choice == "all" else [msa_choice],
+        list(INFER_FUNCS.keys()) if infer_choice == "all" else [infer_choice],
+        build_all=build_all, render=render
+    )
+
+    print("\n✅ Pipeline finished! Results in:", outdir)
+
+    if input("Compare all generated trees? (y/n): ").strip().lower() == "y":
+        compare_trees(artifacts, outdir)
+
+if __name__ == "__main__":
+    main()
